@@ -7,7 +7,7 @@
 
 ======== nginx.conf ============
 
-metric_zone  10M;
+metric_zone  size=10M min_time=10ms max_time=10s;
 metric  on;
 
 server {

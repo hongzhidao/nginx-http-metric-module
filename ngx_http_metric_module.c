@@ -12,16 +12,18 @@
 
 
 typedef struct {
-    ngx_atomic_t                total;
     ngx_atomic_t                n1xx;
     ngx_atomic_t                n2xx;
     ngx_atomic_t                n3xx;
     ngx_atomic_t                n4xx;
     ngx_atomic_t                n5xx;
-    ngx_msec_int_t              avg_time;
-    ngx_msec_int_t              min_time;
-    ngx_msec_int_t              max_time;
-    ngx_msec_int_t              elapse;
+    ngx_atomic_t                total;
+
+    ngx_msec_t                  avg_time;
+    ngx_msec_t                  min_time;
+    ngx_msec_t                  max_time;
+
+    ngx_msec_t                  elapse;
     ngx_uint_t                  times;
 } ngx_http_metric_shctx_t;
 
@@ -29,6 +31,8 @@ typedef struct {
 typedef struct {
     ngx_http_metric_shctx_t     *sh;
     ngx_slab_pool_t             *shpool;
+    ngx_msec_t                   min_time;
+    ngx_msec_t                   max_time;
 } ngx_http_metric_shmctx_t;
 
 
@@ -36,11 +40,6 @@ typedef struct {
     ngx_shm_zone_t              *shm_zone;
     ngx_flag_t                   enable;
 } ngx_http_metric_loc_conf_t;
-
-
-typedef struct {
-
-} ngx_http_metric_ctx_t;
 
 
 static ngx_int_t ngx_http_metric_init(ngx_conf_t *cf);
@@ -57,11 +56,13 @@ static char *ngx_http_metric_status(ngx_conf_t *cf, ngx_command_t *cmd,
 static char *ngx_http_metric_reset(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 
+static void ngx_http_metric_cleanup(void *data);
+
 
 static ngx_command_t ngx_http_metric_commands[] = {
 
     { ngx_string("metric_zone"),
-      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      NGX_HTTP_MAIN_CONF|NGX_CONF_1MORE,
       ngx_http_metric_zone,
       0,
       0,
@@ -132,13 +133,8 @@ static ngx_str_t  ngx_http_metric_zone_name = ngx_string("metric_zone");
 static ngx_int_t
 ngx_http_metric_header_filter(ngx_http_request_t *r)
 {
-    ngx_uint_t                   status;
-    ngx_time_t                  *tp;
-    ngx_msec_int_t               ms;
-    ngx_http_metric_ctx_t       *ctx;
-    ngx_http_metric_shctx_t     *sh;
-    ngx_http_metric_shmctx_t    *shmctx;
     ngx_http_metric_loc_conf_t  *mlcf;
+    ngx_http_cleanup_t          *cln;
 
     mlcf = ngx_http_get_module_loc_conf(r, ngx_http_metric_module);
 
@@ -146,80 +142,13 @@ ngx_http_metric_header_filter(ngx_http_request_t *r)
         return ngx_http_next_header_filter(r);
     }
 
-    ctx = ngx_http_get_module_ctx(r, ngx_http_metric_module);
-    if (ctx) {
-        return ngx_http_next_header_filter(r);
-    }
-
-    ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_metric_ctx_t));
-    if (ctx == NULL) {
+    cln = ngx_http_cleanup_add(r, 0);
+    if (cln == NULL) {
         return NGX_ERROR;
     }
 
-    ngx_http_set_ctx(r, ctx, ngx_http_metric_module);
-
-    shmctx = mlcf->shm_zone->data;
-    sh = shmctx->sh;
-
-    tp = ngx_timeofday();
-
-    ms = (ngx_msec_int_t)
-             ((tp->sec - r->start_sec) * 1000 + (tp->msec - r->start_msec));
-    ms = ngx_max(ms, 0);
-
-    ngx_shmtx_lock(&shmctx->shpool->mutex);
-
-    status = r->headers_out.status;
-
-    if (status >= 200 && status < 300)
-    {
-        /* 2XX */
-        sh->n2xx++;
-
-    } else if (status >= 300 && status < 400)
-    {
-        /* 3XX */
-        sh->n3xx++;
-
-    } else if (status >= 400 && status < 500)
-    {
-        /* 4XX */
-        sh->n4xx++;
-
-    } else if (status >= 500 && status < 600)
-    {
-        /* 5XX */
-        sh->n5xx++;
-
-    } else {
-        /* 1XX */
-        sh->n1xx++;
-    }
-
-	sh->total++;
-
-    if (ms > 0) {
-	    sh->times++;
-        sh->elapse += ms;
-
-		if (sh->min_time == 0) {
-            sh->min_time = ms;
-	
-		} else if (ms < sh->min_time) {
-            sh->min_time = ms;
-        }
-
-		if (sh->max_time == 0) {
-            sh->max_time = ms;
-
-        } else if (ms > sh->max_time) {
-            sh->max_time = ms;
-        }
-
-        sh->avg_time = sh->elapse / sh->times;
-    }
-
-    ngx_shmtx_unlock(&shmctx->shpool->mutex);
+    cln->handler = ngx_http_metric_cleanup;
+    cln->data = r;
 
     return ngx_http_next_header_filter(r);
 }
@@ -512,6 +441,10 @@ static char *
 ngx_http_metric_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ssize_t                            size;
+    ngx_uint_t                         i;
+    ngx_str_t                          s;
+    ngx_msec_t                         min_time;
+    ngx_msec_t                         max_time;
     ngx_str_t                         *value;
     ngx_shm_zone_t                    *shm_zone;
     ngx_http_metric_shmctx_t          *shmctx;
@@ -523,19 +456,67 @@ ngx_http_metric_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
-    size = ngx_parse_size(&value[1]);
+    size = 0;
+    min_time = 1; /* 1 ms */
+    max_time = 60 * 1000;  /* 1 minute */
 
-    if (size == NGX_ERROR) {
+    for (i = 1; i < cf->args->nelts; i++) {
+
+        if (ngx_strncmp(value[i].data, "size=", 5) == 0) {
+
+            s.data = value[i].data + 5;
+            s.len = value[i].data + value[i].len - s.data;
+
+            size = ngx_parse_size(&s);
+
+            if (size == NGX_ERROR) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "invalid zone size \"%V\"", &value[i]);
+                return NGX_CONF_ERROR;
+            }
+
+            if (size < (ssize_t) (8 * ngx_pagesize)) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "zone \"%V\" is too small", &value[i]);
+                return NGX_CONF_ERROR;
+            }
+
+            continue;
+        }
+
+        if (ngx_strncmp(value[i].data, "min_time=", 9) == 0) {
+
+            s.data = value[i].data + 9;
+            s.len = value[i].data + value[i].len - s.data;
+
+            min_time = ngx_parse_time(&s, 0);
+            if (min_time == (ngx_msec_t) NGX_ERROR) {
+                return "invalid value";
+            }
+
+            continue;
+        }
+
+        if (ngx_strncmp(value[i].data, "max_time=", 9) == 0) {
+
+            s.data = value[i].data + 9;
+            s.len = value[i].data + value[i].len - s.data;
+
+            max_time = ngx_parse_time(&s, 0);
+            if (max_time == (ngx_msec_t) NGX_ERROR) {
+                return "invalid value";
+            }
+
+            continue;
+        }
+
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "invalid zone size \"%V\"", &value[1]);
+                           "invalid parameter \"%V\"", &value[i]);
         return NGX_CONF_ERROR;
     }
 
-    if (size < (ssize_t) (8 * ngx_pagesize)) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "zone \"%V\" is too small", &value[1]);
-        return NGX_CONF_ERROR;
-    }
+    shmctx->min_time = min_time;
+    shmctx->max_time = max_time;
 
     shm_zone = ngx_shared_memory_add(cf, &ngx_http_metric_zone_name, size,
                                      &ngx_http_metric_module);
@@ -642,6 +623,83 @@ ngx_http_metric_reset(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     mlcf->shm_zone = shm_zone;
 
     return NGX_CONF_OK;
+}
+
+
+static void
+ngx_http_metric_cleanup(void *data)
+{
+    ngx_http_request_t  *r = data;
+
+    ngx_uint_t                   status;
+    ngx_time_t                  *tp;
+    ngx_msec_t                   ms;
+    ngx_http_metric_shctx_t     *sh;
+    ngx_http_metric_shmctx_t    *shmctx;
+    ngx_http_metric_loc_conf_t  *mlcf;
+
+    mlcf = ngx_http_get_module_loc_conf(r, ngx_http_metric_module);
+
+    shmctx = mlcf->shm_zone->data;
+    sh = shmctx->sh;
+
+    tp = ngx_timeofday();
+
+    ms = (ngx_msec_t) ((tp->sec - r->start_sec) * 1000 + (tp->msec - r->start_msec));
+
+    ngx_shmtx_lock(&shmctx->shpool->mutex);
+
+    status = r->headers_out.status;
+
+    if (status >= 200 && status < 300)
+    {
+        /* 2XX */
+        sh->n2xx++;
+
+    } else if (status >= 300 && status < 400)
+    {
+        /* 3XX */
+        sh->n3xx++;
+
+    } else if (status >= 400 && status < 500)
+    {
+        /* 4XX */
+        sh->n4xx++;
+
+    } else if (status >= 500 && status < 600)
+    {
+        /* 5XX */
+        sh->n5xx++;
+
+    } else {
+        /* 1XX */
+        sh->n1xx++;
+    }
+
+	sh->total++;
+
+    if (ms > shmctx->min_time && ms < shmctx->max_time) {
+	    sh->times++;
+        sh->elapse += ms;
+
+		if (sh->min_time == 0) {
+            sh->min_time = ms;
+	
+		} else if (ms < sh->min_time) {
+            sh->min_time = ms;
+        }
+
+		if (sh->max_time == 0) {
+            sh->max_time = ms;
+
+        } else if (ms > sh->max_time) {
+            sh->max_time = ms;
+        }
+
+        sh->avg_time = sh->elapse / sh->times;
+    }
+
+    ngx_shmtx_unlock(&shmctx->shpool->mutex);
 }
 
 
