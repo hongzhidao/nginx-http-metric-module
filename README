@@ -1,29 +1,29 @@
 
-======== example ==============
+================= example ==================
 > curl http://yourip/metric_status
 
 {"1xx":0,"2xx":21715,"3xx":48,"4xx":94,"5xx":2,"total":21859,"avg_time":0.036,"min_time":0.001,"max_time":10.484}
 
 
-======== nginx.conf ============
+================= nginx.conf ===============
 
 metric_zone  size=10M min_time=10ms max_time=10s;
 metric  on;
 
 server {
-	listen  80;
+    listen  80;
 
     location / {
         root  html;
     }
 
-	location /metric_status {
-		metric_status  on;
+    location /metric_status {
+	metric_status  on;
         metric  off;
-	}
+    }
 
-	location /metric_reset {
-		metric_reset  on;
+    location /metric_reset {
+	metric_reset  on;
         metric  off;
-	}
+    }
 }
