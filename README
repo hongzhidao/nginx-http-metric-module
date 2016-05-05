@@ -11,19 +11,19 @@ metric_zone  10M;
 metric  on;
 
 server {
-	listen  80;
+    listen  80;
 
     location / {
         root  html;
     }
 
-	location /metric_status {
-		metric_status  on;
+    location /metric_status {
+	metric_status  on;
         metric  off;
-	}
+    }
 
-	location /metric_reset {
-		metric_reset  on;
+    location /metric_reset {
+	metric_reset  on;
         metric  off;
-	}
+    }
 }
