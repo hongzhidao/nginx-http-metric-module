@@ -1,6 +1,7 @@
 
 ================= example ==================
 > curl http://yourip/metric_status
+
 {"1xx":0,"2xx":21715,"3xx":48,"4xx":94,"5xx":2,"total":21859,"avg_time":0.036,"min_time":0.001,"max_time":10.484}
 
 
